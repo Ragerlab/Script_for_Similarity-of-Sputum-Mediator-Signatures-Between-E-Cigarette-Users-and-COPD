@@ -1,0 +1,1428 @@
+---
+title: "Comparison Between Soluble Mediator Profiles in COPD and E-Cig Use"
+author: "Elise Hickman"
+output:
+  html_document:
+    code_folding: show
+    toc: true
+    toc_depth: 6
+    number_sections: true
+---
+
+# Load packages
+
+```{r message = FALSE, warning = FALSE}
+# Clears global environment
+rm(list = ls(all.names = TRUE)) 
+
+# If needed, install and load packages
+library(this.path) # For file path
+library(tidyverse) # for data organization
+library(janitor) # for data cleaning
+library(openxlsx) # for writing out results
+library(DT) # for visualizing tables in R markdown
+library(vegan) # for Jaccard distance
+library (RColorBrewer) # for correlation plot
+library(corrplot) # for correlation plot
+library(patchwork) # for graphing
+library(scales) # for graphing
+library(ggpubr) # for making figure panel
+library(factoextra) # for PCA
+library(forcats) # for releveling
+library(rstatix) # for Mahalanobis distance
+library(HDMD) # for Mahalanobis distance
+library(cluster) # for Mahalanobis distance
+library(sva) # for batch adjustment
+library(ggpmisc) # for graphing
+library(pheatmap) # for heatmaps
+library(viridis) # for colors
+library(kohonen) # for self-organizing heat map
+library(factoextra) # for k-means clustering
+library(table1) # for summary table
+library(deeptime) # for plotting
+
+# Redefine masked functions
+select <- dplyr::select
+rename <- dplyr::rename
+margin <- ggplot2::margin
+
+# Set theme
+theme_set(theme_bw())
+
+# Set working directory
+setwd(this.dir())
+```
+
+# Import and clean data
+
+"md" is used to indicate "mediator data." 
+
+## COPD
+
+Data is imported from files that were created as part of the "Summary Tables and Variable by Variable Analysis" code.
+
+```{r message = FALSE}
+# Mediator data
+md_copd <- read.xlsx("1_InputFiles/COPD_MediatorData_Imputed_07.17.2025.xlsx")
+
+# Demographics data
+demo_copd <- read.xlsx("1_InputFiles/2023_06_09 COPD Demographics.xlsx") %>%
+  mutate("GoldStage" = recode(GoldStratum, "1" = "Control", "2" = "Pre-COPD", 
+                                   "3" = "GOLD 1/2", "4" = "GOLD 3")) %>%
+  mutate(GoldStage = factor(GoldStage, levels = c("Control", "Pre-COPD", "GOLD 1/2", "GOLD 3")))
+
+# Merge data and set GOLD variable as factor
+md_copd <- md_copd %>%
+  left_join(demo_copd %>% select(c(SubjectID, GoldStage)), by = "SubjectID") %>%
+  relocate(GoldStage, .after = "SubjectID")
+```
+
+## E-Cig
+
+Import data from Hickman et al 2022 (Biomarkers of Airway Immune Homeostasis Differ Significantly with Generation of E-Cigarettes, DOI: 10.1164/rccm.202202-0373OC). Mediator filtering and imputed was copied from the code from the previous study. 
+```{r}
+# Import data table
+demo_ecig <- read.csv("1_InputFiles/2021_06_15 E-Cig IS Project Demographics.csv")
+
+# Import data table as data frame and make Subject IDs row labels.
+md_ecig <- data.frame(read.xlsx("1_InputFiles/2021_06_29 E-Cig IS Project Mediators.xlsx"))
+md_ecig_devices <- data.frame(md_ecig$Device, row.names = md_ecig$Subject_ID)
+
+# Create only numeric data
+md_ecig <- data.frame(md_ecig[ , 3:47], row.names = md_ecig$Subject_ID)
+
+# Filter out mediators that were detected in fewer than 25 subjects (~25% of the cohort, since we have four groups).
+md_ecig <- md_ecig[, which(as.numeric(colSums(md_ecig != 0)) > 25)]
+
+# Impute zeroes as the sqrt of the lowest value in that column.
+md_ecig <- as.data.frame(apply(md_ecig[ , 1:43], 2, function(x) replace(x, x == 0, sqrt(min(x[x>0])))))
+
+# Put column names in alphabetical order
+md_ecig <- md_ecig[,order(names(md_ecig))]
+
+# Add groups and demographics back into data frame
+demo_ecig$Subject.ID <- sub(" ", "_", demo_ecig$Subject.ID) # Make subject ID formatting match the mediator dataframe 
+
+md_ecig <- md_ecig %>%
+  rownames_to_column("Subject.ID") %>%
+  right_join(demo_ecig, by = "Subject.ID")
+```
+
+## Merge data frames
+
+Some cleaning steps are needed to match column names of one data frame to the other data frame, clarify group labels, and add batch. Controls from each study were renamed "Control" in the new "Group_2" column rather than their study-specific name (COPD1 for COPD cohort, NS/NV for e-cig study).
+```{r}
+md_copd_cleaned <- md_copd %>%
+  mutate("Batch" = "COPD") %>%
+  rename("Group" = "GoldStage") %>%
+  mutate(Group_2 = Group)
+
+md_ecig_cleaned <- md_ecig %>%
+  rename("SubjectID" = "Subject.ID") %>%
+  rename("Group" = "Device") %>%
+  mutate("Batch" = "E-Cig") %>%
+  mutate(Group_2 = recode(Group, "NS/NV" = "Control")) %>%
+  filter(Group != "SM")
+```
+
+Trim data frames to columns found in both data frames.
+```{r}
+# COPD
+md_copd_cleaned <- data.frame(md_copd_cleaned[, colnames(md_copd_cleaned) %in% colnames(md_ecig_cleaned)])
+
+# E-Cig
+md_ecig_cleaned <- data.frame(md_ecig_cleaned[, colnames(md_ecig_cleaned) %in% colnames(md_copd_cleaned)])
+```
+
+Merge the two data frames and recode demographic variables so they match. Subject IDs are put back into row names since that is where they will need to be for the next steps. 
+```{r}
+md_all <- bind_rows(md_copd_cleaned, md_ecig_cleaned) %>%
+  column_to_rownames("SubjectID")
+```
+
+# Outlier detection
+```{r}
+# Prepare data frame for PCA
+pseudolog <- function(x) log2(x+1)
+
+pca_df <- md_all %>%
+  dplyr::select(CRP:VEGF) %>%
+  mutate(across(where(is.numeric), pseudolog))
+
+# Run PCA
+pca <- prcomp(pca_df, scale = TRUE)
+
+# Visualize PCA to see if any obvious outliers are detected
+fviz_pca_ind(pca, 
+             label = "none",
+             pointsize = 3) +
+theme(axis.title = element_text(face = "bold", size = rel(1.1)),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(), 
+      plot.title = element_text(hjust = 0.5))
+```
+By visual inspection, there aren't any obvious outliers, so we can use a formula to detect outliers. One standard way to detect outliers is the criterion of being "more than 6 standard deviations away from the mean." [Source](https://privefl.github.io/blog/detecting-outlier-samples-in-pca/)
+
+```{r}
+# Create a scoring funciton to detect PCA sample outliers. The input is PCA results data frame and the number of standard deviations for the cutoff. The output is outlier names. 
+outlier_detection = function(pca_df, sd){
+
+    # getting scores
+    scores = pca_df$x
+    
+    # identifying samples that are > 6 standard deviations away from the mean
+    outlier_indices = apply(scores, 2, function(x) which( abs(x - mean(x)) > (sd * sd(x)) )) %>%
+        Reduce(union, .)
+    
+    # getting sample names
+    outliers = rownames(scores)[outlier_indices]
+    
+    return(outliers)
+}
+
+# Call function with different standard deviation cutoffs
+outlier_detection(pca, 6)
+```
+
+No outliers. 
+
+# Correlation plots
+
+New analysis: correlation plots only for the COPD participants.
+
+```{r}
+# Filter data frame for each group of interest
+copd_ctrl <- filter(md_copd, GoldStage == "Control")
+copd_p <- filter(md_copd, GoldStage == "Pre-COPD")
+copd_1.2 <- filter(md_copd, GoldStage == "GOLD 1/2")
+copd_3 <- filter(md_copd, GoldStage == "GOLD 3")
+
+# To add significance to correlation plot, run this function
+cor.mtest <- function(mat, ...) {
+  mat <- as.matrix(mat)
+  n <- ncol(mat)
+  p.mat<- matrix(NA, n, n)
+  diag(p.mat) <- 0
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      tmp <- cor.test(mat[, i], mat[, j], ...)
+      p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+    }
+  }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+
+# Make a data frame with plot titles for each plot
+corrplot_titles <- data.frame(data_frame_name = c("copd_ctrl", "copd_p", "copd_1.2", "copd_3"),
+                              plot_title = c("Controls", "Pre-COPD", "GOLD Stage 1/2", "GOLD Stage 3"))
+
+# Function for making correlation plot
+custom.corrplot <- function(data, corrplot_titles) {
+  
+  df_name <- deparse(substitute(data))
+  
+  plot_title <- (corrplot_titles %>% filter(data_frame_name == df_name))[1,2]
+  
+  data_dm <- data %>%
+    column_to_rownames("SubjectID") %>%
+    dplyr::select(CRP:VEGF) %>%
+    data.matrix()
+  
+  data_corr <- cor(data_dm)
+  data_corr[data_corr <= 0.6 & data_corr >= -0.6] = 0 # Show only correlations with |R| > 0.6 
+  
+  p.mat <- cor.mtest(data_dm)
+  
+  corrplot(data_corr, 
+           method = "circle", 
+           type = "upper",
+           order = "alphabet",
+           tl.col = "black",
+           p.mat = p.mat, 
+           sig.level = 0.01,
+           insig = "blank",
+           diag = FALSE,
+           title = plot_title,
+           mar=c(0,0,1,0),
+           tl.cex = 0.7)
+
+}
+
+
+# Make panel of correlation plots and write them out
+pdf(file = "2_OutputFigs/Corrplots_COPD.pdf",   # The directory you want to save the file in
+    width = 6, # The width of the plot in inches
+    height = 6)
+
+par(mfrow = c(2, 2))
+corrplot_ctrl <- custom.corrplot(copd_ctrl, corrplot_titles)
+corrplot_p <- custom.corrplot(copd_p, corrplot_titles)
+corrplot_1.2 <- custom.corrplot(copd_1.2, corrplot_titles)
+corrplot_3 <- custom.corrplot(copd_3, corrplot_titles)
+
+dev.off()
+```
+
+Then, we need to count how many similar correlations there are between correlation matrices of each group. This is completed by first counting the number of significant comparisons (defined as |R| > 0.6 and p < 0.01) that are the same between each matrix (in a pairwise approach). Then, that number is subtracted from the total number of comparisons to get the number of non-significant comparisons. Last, the results are tabulated together and a total similarity count is determined. 
+
+First, we need to take the results of the correlation functions used to generate the plots above and reorganize them into a useful format for comparing the results. 
+```{r}
+# Function to create summary table of correlation values using separate data frames for each group
+corr_pval_summary_sig <- function(data) {
+  
+  # make numeric data matrix
+  data_dm <- data %>% 
+    column_to_rownames("SubjectID") %>%
+    dplyr::select(CRP:VEGF) %>%
+    data.matrix() 
+  
+  data_corr <- cor(data_dm) # calculate correlations
+  p.mat <- cor.mtest(data_dm) # calculate p values for correlations 
+  
+  # Summarize correlation values by creating a new data frame containing each variable in the pair in its own column as well as a column that combines those two variables. "upper tri" takes the upper half of the correlation matrix since as a square matrix, there are duplicate values for each pair. 
+  corrsummary <- data.frame(var1 = rownames(data_corr)[row(data_corr)[upper.tri(data_corr)]], 
+           var2 = colnames(data_corr)[col(data_corr)[upper.tri(data_corr)]], 
+           corr = data_corr[upper.tri(data_corr)]) %>% 
+  unite(var1_var2, var1, var2, sep = "_", remove = TRUE)
+  
+  # Summarizes p values using the same mechanics as in summarizing correlation values above
+  psummary <- data.frame(var1 = rownames(p.mat)[row(p.mat)[upper.tri(p.mat)]], 
+           var2 = colnames(p.mat)[col(p.mat)[upper.tri(p.mat)]], 
+           pval = p.mat[upper.tri(p.mat)]) %>% 
+  unite(var1_var2, var1, var2, sep = "_", remove = TRUE)
+  
+  # Create a variable representing the name of the input data
+  df_name = paste0(deparse(substitute(data)))
+  
+  # Join together correlation coefficients and pvalues; filter by magnitude of correlation and significance of correlation, and add a column to indicate what group these correlations are coming from
+  corrpval <- right_join(corrsummary, psummary, by = "var1_var2") %>%
+  filter(abs(corr) > 0.6 & pval < 0.01) %>%
+  mutate("group" = df_name)
+  
+  # Return final data frame
+  corrpval
+}
+
+# Apply to each of the data frames we are interested in
+corrpval_copdctrl_sig <- corr_pval_summary_sig(copd_ctrl)
+corrpval_copdp_sig <- corr_pval_summary_sig(copd_p)
+corrpval_copd1.2_sig <- corr_pval_summary_sig(copd_1.2)
+corrpval_copd3_sig <- corr_pval_summary_sig(copd_3)
+```
+
+Next, we need to create a data frame of all possible correlations, with correlations in rows and groups in columns. 1 will indicate that this correlation was significant and with |R| > 0.6, while 0 will indicate absence of that relationship in that group. This input will be passed to Jaccard distnace/similarity metric
+```{r}
+# We can extract the pairs of variables using similar code to the start of our function above 
+
+## Make numeric data matrix
+data_dm <- copd_ctrl %>%
+  column_to_rownames("SubjectID") %>%
+  dplyr::select(ALB:VEGF) %>%
+  data.matrix() 
+
+## Calculate correlations
+data_corr <- cor(data_dm) 
+  
+## Create data frame
+corrsummary_counts <- data.frame(var1 = rownames(data_corr)[row(data_corr)[upper.tri(data_corr)]], 
+           var2 = colnames(data_corr)[col(data_corr)[upper.tri(data_corr)]]) %>%
+  unite(var1_var2, var1, var2, sep = "_", remove = TRUE)
+
+## 351 total correlations possible
+length(corrsummary_counts$var1_var2)
+
+# Clean data frames
+corrpval_copdctrl_sig_cl <- corrpval_copdctrl_sig %>% mutate(group = 1) %>% rename("copd_ctrl" = "group") %>%  select(-c(corr, pval))
+corrpval_copdp_sig_cl <- corrpval_copdp_sig %>% mutate(group = 1) %>% rename("copd_p" = "group") %>%  select(-c(corr, pval))
+corrpval_copd1.2_sig_cl <- corrpval_copd1.2_sig %>% mutate(group = 1) %>% rename("copd_1.2" = "group") %>%  select(-c(corr, pval))
+corrpval_copd3_sig_cl <- corrpval_copd3_sig %>% mutate(group = 1) %>% rename("copd_3" = "group") %>%  select(-c(corr, pval))
+
+# Add binary data to data frame indicating if that group contained that correlations
+all_dfs <- list(corrpval_copdctrl_sig_cl, corrpval_copdp_sig_cl, corrpval_copd1.2_sig_cl, corrpval_copd3_sig_cl)
+
+# Create binary data frame for Jaccard distance
+df_counts <- all_dfs %>%
+  reduce(full_join, by = "var1_var2") %>%
+  column_to_rownames("var1_var2") %>%
+  replace(is.na(.), 0)
+```
+
+
+## Visualizing similarities in correlation using upset plot
+```{r warning = FALSE}
+# Load package
+library(ComplexUpset)
+
+# Prepare data
+upsetprep <- df_counts %>%
+  rownames_to_column("var1_var2") %>%
+  rename("Pre-COPD" = "copd_p", "Control" = "copd_ctrl", "GOLD 1/2" = "copd_1.2", "GOLD 3" = "copd_3")
+
+# Define colors for each group
+group_colors <- c('Control' = "#57106e", 'Pre-COPD' = "#bc3754", 'GOLD 1/2' = "#f98e09", 'GOLD 3' = "#fcffa4")
+
+# Make plot
+upset_plot <- upset(
+  
+  # Input data
+  upsetprep, 
+  
+  # Groups to plot
+  c("GOLD 3", "GOLD 1/2", "Pre-COPD", "Control"),
+  
+  # Don't order groups by set size
+  sort_sets = FALSE,
+  
+  # X axis title
+  name = "Group or Combination of Groups",
+  
+  # Remove background stripes
+  stripes='white', 
+  
+  # Controlling group colors
+  matrix=(
+        intersection_matrix(geom=geom_point(shape='circle filled', size=3))
+        + scale_color_manual(
+            values = group_colors,
+            guide ='none'
+        )
+    ),
+  
+  ,
+    queries=list(
+        upset_query(set = 'Control', fill='#57106e'),
+        upset_query(set = 'Pre-COPD', fill='#bc3754'),
+        upset_query(set = 'GOLD 1/2', fill='#f98e09'),
+        upset_query(set  ='GOLD 3', fill = "#fcffa4")
+    ),
+  
+  # Controlling appearance
+  base_annotations = list(
+    
+    # Controlling appearance for main bar plot
+        'Intersection size' = intersection_size(
+            mapping = aes(fill = 'bars_color', color = 'outline_color'),
+            bar_number_threshold = 100,
+            text = element_text(vjust = -0.5)) + 
+          labs(y = "Number of Significantly \nCorrelated Mediators") +
+          scale_fill_manual(values = c('bars_color' = "grey90"), guide = 'none') +
+          scale_color_manual(values = c('outline_color' = "grey10"), guide = 'none') +
+          ylim(c(0, 80)) +
+          scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+          theme(panel.grid.major.x = element_blank(),
+                panel.grid.minor.y = element_blank(),
+                axis.line.x.bottom = element_line(linewidth = 0.5),
+                axis.line.y.left = element_line(linewidth = 0.5))
+  ),
+      set_sizes = upset_set_size(mapping = aes(color = 'outline_color'),
+                                 position = 'right') +
+    ylab("Number of Significant \nCorrelations") +
+    scale_color_manual(values = c('outline_color' = "grey10"), guide = 'none') +
+    geom_text(aes(label=..count..), hjust=-0.5, stat='count') +
+    expand_limits(y = 250)
+)
+
+upset_plot
+
+png("2_OutputFigs/Corrplot_Upset.png", width = 7, height = 4, units = "in", res = 1200)
+upset_plot
+invisible(dev.off())
+
+```
+
+# Removing batch effects with ComBat
+
+## Obtain batch-adjusted values
+
+The code in this section was modeled after the vignettes shown in the [SVA package documentation](https://www.bioconductor.org/packages/devel/bioc/vignettes/sva/inst/doc/sva.pdf).
+
+ComBat adjustment was chosen because it adjusts for known batches, which we have. We will include age as a variable of interest alongside group because we know that there are age differences between COPD groups and between the COPD cohort and the e-cig study. 
+Setting up data.
+```{r}
+# Read in COPD Demographics
+demo_copd <- read.xlsx("1_InputFiles/2023_06_09 COPD Demographics.xlsx") %>%
+  select(c("SubjectID", "Age"))
+
+demo_combo <- rbind(demo_copd, demo_ecig %>% rename("SubjectID" = "Subject.ID") %>% dplyr::select(c("SubjectID", "Age")))
+
+# Create data frame of subject groups and ages.
+demo_all <- md_all %>%
+  rownames_to_column("SubjectID") %>%
+  left_join(demo_combo, by = "SubjectID") %>%
+  dplyr::select(c("SubjectID", "Age", "Group", "Group_2", "Batch"))
+
+# Create data frame of only mediator expression data
+md_all_trans <- md_all %>% 
+  dplyr::select(CRP:VEGF) %>%
+  t() %>%
+  as.data.frame()
+```
+
+Creating matrix model. An explanation of the par.prior and prior.plot arguments can be found [here] (https://support.bioconductor.org/p/71198/). Based on recommendations there and prior plots below, we will keep par.prior = TRUE. 
+```{r message = FALSE}
+# Create batch vector
+batch = demo_all$Batch
+
+# Create model matrix
+modcombat = model.matrix(~ Group_2, data = demo_all)
+
+# First run the adjustment with prior.plot = TRUE to see if estimate of the empirical batch effect density (black) matches a parametric estimate (red). Guidance for the ComBat function indicates very minimal difference between par.prior = TRUE and FALSE. 
+set.seed(118) # Not sure if this is necessary, but doing it just in case
+combat_md <- ComBat(dat = md_all_trans, batch = batch, mod = modcombat, par.prior = TRUE, prior.plot = TRUE)
+```
+Visualizing adjusted values.
+```{r}
+histograms <- combat_md %>%
+  t() %>%
+  as.data.frame() %>%
+  pivot_longer(CRP:VEGF, 
+               names_to = "Variable", 
+               values_to = "Value") %>%
+  ggplot(aes(Value)) +
+  geom_histogram() +
+  facet_wrap(~ Variable, scales = "free")
+
+histograms
+```
+
+Counting positive and negative values demonstrates that a number of values are now negative, but because our primary interest is in relative measures, not absolute concentrations, this is okay.
+```{r}
+posneg_counts <- combat_md %>%
+  t() %>%
+  as.data.frame() %>%
+  pivot_longer(CRP:VEGF, 
+               names_to = "Variable", 
+               values_to = "Value") %>%
+  group_by(Variable) %>%
+  mutate(positive = sum(Value > 0), negative = sum(Value < 0)) %>%
+  distinct(Variable, .keep_all = TRUE) %>%
+  select(-Value)
+
+datatable(posneg_counts)
+```
+
+## Compare data before and after adjustment
+
+Pre ComBat adjustment data.
+```{r warning = FALSE}
+# Filter and organize data
+age_corr_data_pre <- filter(md_all, Group == "NS/NV" |  Group == "Control") %>%
+  rownames_to_column("SubjectID") %>%
+  left_join(demo_combo, by = "SubjectID") %>%
+  mutate(Group = recode(Group, "Control" = "COPD Ctrl", "NS/NV" = "E-Cig Ctrl"))
+
+pseudolog <- function(x) log2(x+1)
+
+age_corr_data_pre_forscatterplot <- age_corr_data_pre %>%
+  pivot_longer(CRP:VEGF, 
+               names_to = "Variable", 
+               values_to = "Value") %>%
+  mutate(Value_Log = pseudolog(Value))
+
+# Make plot
+age_corr_pre_facetgraph <- ggplot(age_corr_data_pre_forscatterplot, aes(x = Age, y = Value_Log)) +
+  geom_point(aes(color = Group)) +
+  scale_color_manual(values = c("chocolate1", "mediumorchid3")) +
+  stat_poly_line(color = "black") +
+  stat_poly_eq(use_label(c("R2", "p"))) +
+  ylab("log2(Mediator Concentration(pg/mL))") +
+  scale_y_continuous(expand = expansion(mult = c(0.25, 0.8))) +
+  facet_wrap(~Variable, scales = "free_y")
+
+age_corr_pre_facetgraph
+
+#pdf(file = "Output_Files/Age_Correlation_Facetplot_PreAdj.pdf",   # The directory you want to save the file in
+    #width = 12, # The width of the plot in inches
+    #height = 6)
+
+#age_corr_pre_facetgraph
+
+#dev.off()
+```
+Post ComBat adjustment data.
+```{r warning = FALSE}
+# The lowest value of our data is -400786.5, so we will have to add a very large pseudocount to be able to log-transform the data
+min(combat_md)
+```
+```{r warning = FALSE}
+# Create pseudolog function
+pseudolog_postadj <- function(x) log2(x+500000)
+
+# Add back in relevant group data to the ComBat-adjusted values
+md_combat <- combat_md %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("SubjectID")
+
+md_combat_filtered <- md_combat %>%
+  right_join(demo_all, by = "SubjectID") %>%
+  filter(Group == "NS/NV" |  Group == "Control") %>%
+  mutate(Group = recode(Group, "COPD1" = "COPD Ctrl", "NS/NV" = "E-Cig Ctrl"))
+
+age_corr_data_combat_forscatterplot <- md_combat_filtered %>%
+  pivot_longer(CRP:VEGF, 
+               names_to = "Variable", 
+               values_to = "Value") %>%
+  mutate(Value_Log = pseudolog_postadj(Value))
+
+# Make plot
+age_corr_post_facetgraph <- ggplot(age_corr_data_combat_forscatterplot, aes(x = Age, y = Value_Log)) +
+  geom_point(aes(color = Group)) +
+  scale_color_manual(values = c("chocolate1", "mediumorchid3")) +
+  stat_poly_line(color = "black") +
+  stat_poly_eq(use_label(c("R2", "p"))) +
+  ylab("log2(Adjusted Relative Mediator Concentration))") +
+  scale_y_continuous(expand = expansion(mult = c(0.25, 0.8)), 
+                     labels = scales::label_number(accuracy = 1)) +
+  facet_wrap(~Variable, scales = "free_y")
+
+age_corr_post_facetgraph
+
+#pdf(file = "Output_Files/Age_Correlation_Facetplot_PostComBatAdj.pdf",   # The directory you want to save the file in
+    #width = 12, # The width of the plot in inches
+   #height = 6)
+
+#age_corr_post_facetgraph
+
+#dev.off()
+```
+# Heatmaps to explore the relationship between group and relative soluble mediator levels 
+
+## All groups together 
+
+Averaged heatmap of log transformed values with controls grouped together.
+```{r}
+# Make summary data frame
+md_combat_heatmap_log_avg_group2 <- md_combat %>%
+  mutate(across(where(is.numeric), pseudolog_postadj)) %>%
+  right_join(demo_all %>% select(SubjectID, Group_2), by = "SubjectID") %>%
+  group_by(Group_2) %>% 
+  summarize(across(where(is.numeric), mean)) %>%
+  mutate(Group_2 = recode(Group_2, "4th Gen" = "4th Gen EC", "3rd Gen" = "3rd Gen EC")) %>%
+  column_to_rownames("Group_2")
+
+# Make data matrix
+md_combat_heatmap_log_avg_group2_dm <- data.matrix(md_combat_heatmap_log_avg_group2)
+
+# Make heatmap
+heatmap <- pheatmap(t(md_combat_heatmap_log_avg_group2_dm ), 
+         color = plasma(100), # sets color scheme
+         angle_col = c("0"), # makes column labels horizontal
+         cellwidth = 60, # sets dimensions of cells so that they don't change with viewer pane size
+         cellheight = 10, # sets dimensions of cells so that they don't change with viewer pane size
+         border_color = "black", # adds black border around cells
+         treeheight_col = 10, # sets dims of trees so that they don't change with viewer pane size
+         fontsize_row = 9, # sets dims of trees so that they don't change with viewer pane size
+         scale = 'row', # scales data by row
+         fontsize_col = 10) # sets font size for column labels
+heatmap
+
+pdf(file = "2_OutputFigs/ECigCOPDHeatmap_BatchAdj_Log_CtrlsTogether_Avg.pdf",
+    width = 11, 
+    height = 6)
+heatmap
+invisible(dev.off())
+```
+## Separated by biological subsets of mediators
+```{r}
+# Neil-defined subsets
+immuno_inflamm <- c("IL1a", "IL1B", "IL8", "TNFa", "IL10", "IL12p70", "CRP")
+chemotax <- c("Eotaxin", "Eotaxin3", "IL12p40", "IP10", "MCP1", "MIP1a", "MIP1B", "TARC", "sICAM1", "sVCAM1")
+prot_enzyme <- c("MMP2", "MMP9", "MPO", "NE")
+```
+
+### Combined controls
+```{r}
+# This function takes input of md_combat, variables to keep in the data frame, and desired output dimensions of the heatmap. Output is a saved heatmap in file directory of choice and visualized heatmap in R Markdown.
+bygroup_heatmap_ctrls_together <- function (data, variables, width, height, suffix) {
+  
+  # Get name of vector
+  vector_name <- deparse(substitute(variables))
+  
+  # Create heatmap input
+  heatmap_input <- data %>%
+    mutate(across(where(is.numeric), pseudolog_postadj)) %>%
+    right_join(demo_all %>% select(SubjectID, Group_2), by = "SubjectID") %>%
+    group_by(Group_2) %>% 
+    summarize(across(where(is.numeric), mean)) %>%
+    mutate(Group_2 = recode(Group_2, "4th Gen" = "4th Gen EC", "3rd Gen" = "3rd Gen EC")) %>%
+    column_to_rownames("Group_2") %>%
+    select(all_of(variables)) %>%
+    data.matrix()
+  
+  # Make heatmap
+  heatmap <- pheatmap(t(heatmap_input), 
+         color = plasma(100), # sets color scheme
+         angle_col = c("0"), # makes column labels horizontal
+         cellwidth = 60, # sets dimensions of cells so that they don't change with viewer pane size
+         cellheight = 10, # sets dimensions of cells so that they don't change with viewer pane size
+         border_color = "black", # adds black border around cells
+         treeheight_col = 10, # sets dims of trees so that they don't change with viewer pane size
+         fontsize_row = 9, # sets dims of trees so that they don't change with viewer pane size
+         scale = 'row', # scales data by row
+         fontsize_col = 10) # sets font size for column labels
+
+  
+  # Write out PDF
+  dev.off()
+  
+  pdf(file = paste0("2_OutputFigs/Heatmap_ByBioSet_CtrlsTogether_Avg_", 
+                    vector_name, suffix, ".pdf"),
+    width = width, 
+    height = height)
+  
+  print(heatmap)
+  
+  dev.off()
+  
+  # Return heatmap
+  heatmap
+}
+
+# Create heatmaps - batch corrected
+bygroup_heatmap_ctrls_together(md_combat, immuno_inflamm, 8, 4, "_BatchAdj")
+bygroup_heatmap_ctrls_together(md_combat, chemotax, 8, 4, "_BatchAdj")
+bygroup_heatmap_ctrls_together(md_combat, prot_enzyme, 8, 4, "_BatchAdj")
+```
+### Individual subjects
+```{r}
+# Make color palette
+indiv_hm_palette <- colorRampPalette(c("gray80", "gray14"))
+
+# Create annotation data frame
+md_combat_heatmap_log_individual <- md_combat %>%
+  right_join(demo_all %>% select(SubjectID, Group_2), by = "SubjectID") %>%
+  mutate(Group_2 = recode(Group_2, "4th Gen" = "4th Gen EC", "3rd Gen" = "3rd Gen EC")) %>%
+  column_to_rownames("SubjectID") %>%
+  rename("Group" = "Group_2") %>%
+  select(c(Group))
+
+# This function takes input of md_combat, variables to keep in the data frame, and desired output dimensions of the heatmap. Output is a saved heatmap in file directory of choice and visualized heatmap in R Markdown.
+individual_heatmap <- function (data, variables) {
+  
+  # Get name of vector
+  vector_name <- deparse(substitute(variables))
+  
+  # Create heatmap input
+  heatmap_input <- data %>%
+    mutate(across(where(is.numeric), pseudolog_postadj)) %>%
+    right_join(demo_all %>% dplyr::select(SubjectID, Group_2), by = "SubjectID") %>%
+    rename("Group" = "Group_2") %>%
+    column_to_rownames("SubjectID") %>%
+    dplyr::select(all_of(variables)) %>%
+    data.matrix()
+  
+  # Create heatmap colors
+  heatmap_color = list(
+  Group = c("Control" = "#56106EFF", "3rd Gen EC" = "#26828E", "4th Gen EC" = "#3B528B", 
+            "Pre-COPD" = "#BB3754FF", "GOLD 1/2" = "#F98C0AFF", "GOLD 3" = "#F7D13D"))
+
+  heatmap <- pheatmap(t(heatmap_input),
+         annotation_col = md_combat_heatmap_log_individual %>% select(Group),
+         annotation_colors = heatmap_color,
+         scale = 'row', 
+         border_color = "black",
+         color = indiv_hm_palette(100),
+         show_colnames = F,
+         cellwidth = 2,
+         cellheight = 15,
+         treeheight_row = 10,
+         treeheigh_col = 5,
+         main = paste0(vector_name))
+  
+  # Write out PDF
+  #dev.off()
+  
+  #pdf(file = paste0("Output_Files/ECigCOPDIntegration_ByBioGroup/IndividualSubjects_", vector_name, ".pdf"),
+    #width = width, 
+    #height = height)
+  
+  #print(heatmap)
+  
+  #dev.off()
+  
+  # Return heatmap
+  heatmap
+}
+
+# Create heatmaps
+individual_heatmap(md_combat, immuno_inflamm)
+individual_heatmap(md_combat, chemotax)
+individual_heatmap(md_combat, prot_enzyme)
+dev.off()
+
+# Write heatmaps out
+pdf(file = "2_OutputFigs/Heatmap_ByBioSet_IndividualSubjects_immuno_inflamm.pdf",
+    width = 10, 
+    height = 5)
+  
+individual_heatmap(md_combat, immuno_inflamm)
+  
+dev.off()
+
+pdf(file = "2_OutputFigs/Heatmap_ByBioSet_IndividualSubjects_chemotax.pdf",
+    width = 10, 
+    height = 5)
+  
+individual_heatmap(md_combat, chemotax)
+  
+dev.off()
+
+pdf(file = "2_OutputFigs/Heatmap_ByBioSet_IndividualSubjects_prot_enzyme.pdf",
+    width = 10, 
+    height = 5)
+  
+individual_heatmap(md_combat, prot_enzyme)
+  
+dev.off()
+
+# Make heatmap of all mediators
+all_meds <- c(chemotax, immuno_inflamm, prot_enzyme)
+
+pdf(file = "2_OutputFigs/Heatmap_ByBioSet_IndividualSubjects_all_meds.pdf",
+    width = 10, 
+    height = 10)
+  
+individual_heatmap(md_combat, all_meds)
+  
+dev.off()
+```
+
+# Mahalanobis distance to assess similarity between groups
+
+The Mahalanobis distance can be used to determine similarity/dissimilarity between groups in the multivariate space. 
+
+```{r eval = FALSE}
+# How to install HDMD since it is archived:
+# library(devtools)
+# install_url('https://cran.r-project.org/src/contrib/Archive/HDMD/HDMD_1.2.tar.gz')
+```
+
+```{r}
+# Make group ID
+groups <- md_all %>%
+  rownames_to_column("SubjectID") %>%
+  dplyr::select(c(SubjectID, Group_2)) %>%
+  rename("Group" = "Group_2")
+
+# Set up data frame
+# Set up data frame
+md_combat_for_mahalo <- md_combat %>%
+  right_join(groups, by = "SubjectID") %>%
+  dplyr::select(-SubjectID)
+
+# Prepare data to compare groups
+group = matrix(md_combat_for_mahalo$Group)
+group = t(group[,1])
+
+# Variables being used for comparison
+variables = names(md_combat %>% dplyr::select(-SubjectID))
+variables = as.matrix(md_combat_for_mahalo[,variables])
+
+# Get squared mahalanobis distances
+mahala_sq <- pairwise.mahalanobis(x = variables, grouping = group)
+
+# Capture labels
+names = rownames(mahala_sq$means)
+
+# Extract mahalanobis distnace
+mahala = sqrt(mahala_sq$distance)
+
+# Set row and column names in the dissimilarity matrix
+rownames(mahala) = names
+colnames(mahala) = names
+
+# This is the mahalanobis dissimilarity matrix
+datatable(mahala)
+
+# Make a summary data frame
+mahala_summary <- data.frame(var1 = rownames(mahala)[row(mahala)[upper.tri(mahala)]], 
+           var2 = colnames(mahala)[col(mahala)[upper.tri(mahala)]], 
+           mahala_dist = mahala[upper.tri(mahala)]) %>%
+  rename("All Mediators" = "mahala_dist") %>%
+  unite(var_pair, var1, var2, sep = "_")
+
+# Write function for pairwise Mahalnobis distance with subset of mediators
+mahalanobis_subset <- function(data, variable_list) {
+  
+  data <- data %>% 
+    dplyr::select(c(all_of(variable_list), Group))
+  
+  # Prepare data to compare groups
+  group = matrix(data$Group)
+  group = t(group[,1])
+
+  # Variables being used for comparison
+  variables = names(data %>% dplyr::select(-Group))
+  variables = as.matrix(data[,variables])
+
+  # Get squared mahalanobis distances
+  mahala_sq <- pairwise.mahalanobis(x = variables, grouping = group)
+
+  # Capture labels
+  names = rownames(mahala_sq$means)
+
+  # Extract mahalanobis distnace
+  mahala = sqrt(mahala_sq$distance)
+
+  # Set row and column names in the dissimilarity matrix
+  rownames(mahala) = names
+  colnames(mahala) = names
+  
+  # Extract results
+  mahala_summary <- data.frame(var1 = rownames(mahala)[row(mahala)[upper.tri(mahala)]], 
+           var2 = colnames(mahala)[col(mahala)[upper.tri(mahala)]], 
+           mahala_dist = mahala[upper.tri(mahala)]) %>%
+    unite(var_pair, var1, var2, sep = "_")
+  
+  mahala_summary
+}
+
+mahala_immuno <- mahalanobis_subset(md_combat_for_mahalo, immuno_inflamm) %>% rename("Inflamm" = "mahala_dist")
+mahala_chemotax <- mahalanobis_subset(md_combat_for_mahalo, chemotax) %>% rename("Chemotax" = "mahala_dist")
+mahala_prot <- mahalanobis_subset(md_combat_for_mahalo, prot_enzyme) %>% rename("Prot/Enz" = "mahala_dist")
+
+# Make group lists
+ecig_groups <- c("3rd Gen", "4th Gen")
+copd_groups <- c("Pre-COPD", "GOLD 1/2", "GOLD 3")
+control <- c("Control")
+
+# Join together data frames and add grouping
+mahala_all <- list(mahala_summary, mahala_immuno, mahala_chemotax, mahala_prot) %>%
+  reduce(full_join, by = "var_pair") %>%
+  separate(var_pair, into = c("var1", "var2"), remove = FALSE, sep = "_") %>%
+  mutate(type = ifelse(var1 %in% ecig_groups & var2 %in% ecig_groups, "Within Ecig", 
+                       ifelse(var1 %in% ecig_groups & var2 == "Control", "To Ctrl", 
+                              ifelse(var1 %in% ecig_groups & var2 %in% copd_groups | 
+                                       var1 %in% copd_groups & var2 %in% ecig_groups, "Ecig COPD",
+                                     ifelse(var1 == "Control" & var2 %in% copd_groups, "To Ctrl", "Within COPD"))))) %>%
+  mutate(type = recode(type, "Within COPD" = "1", "Within Ecig" = "2", "To Ctrl" = "3", "Ecig COPD" = "4")) %>%
+  arrange(type)
+
+# Add in index column and find where to add breaks in heat map to separate clusters
+mahala_all$index <- 1:nrow(mahala_all)
+hm_breaks <- mahala_all %>% group_by(type) %>% summarise(m=max(index))
+```
+
+
+Distances from 4th Gen e-cig users:
+
+```{r}
+minmax <- function(x, na.rm = TRUE) {
+    return((x- min(x)) /(max(x)-min(x)))
+}
+
+mahala_all_minmax <- mahala_all %>%
+  mutate(across(`All Mediators`:`Prot/Enz`, ~ 1/.x)) %>%
+  mutate(across(`All Mediators`:`Prot/Enz`, minmax))
+
+mahala_all_4thgen <- mahala_all_minmax %>%
+  filter(var1 == "4th Gen" | var2 == "4th Gen") %>%
+  mutate(var_pair = gsub("4th Gen", "", var_pair)) %>%
+  mutate(var_pair = gsub("_", "", var_pair)) %>%
+  dplyr::select(c(var_pair, `All Mediators`:`Prot/Enz`)) %>%
+  pivot_longer(!var_pair, names_to = "variable", values_to = "value") %>%
+  mutate(value = round(value, digits = 3))
+
+row_df <- data.frame(var_pair = c("Control", "3rd Gen", "Pre-COPD", "GOLD 1/2", "GOLD 3"), row = c(5, 4, 3, 2, 1))
+col_df <- data.frame(variable = c("All Mediators", "Inflamm", "Chemotax", "Prot/Enz"), col = c(1, 2, 3, 4))
+
+mahala_all_4thgen <- mahala_all_4thgen %>%
+  left_join(row_df, by = "var_pair") %>%
+  left_join(col_df, by = "variable")
+
+mahala_all_4thgen %>% arrange(row)
+
+vars_x_axis <- c("All Mediators", "Inflammatory", "Chemotactic", "Proteases/Enzymes")
+vars_y_axis <- c("GOLD 3", "GOLD 1/2", "Pre-COPD", "3rd Gen EC", "Control")
+
+baloonplot_4thgen <- ggplot(mahala_all_4thgen, aes(x=factor(col), y=factor(row), color=var_pair, size=value)) +
+  scale_color_manual(values = rev(c("#BB3754FF", "#f7d13d", "#F98C0AFF", "#56106EFF", "#26828e"))) +
+  geom_point() +    # plot as points
+  geom_text(aes(label=value, x=col + 0.25), size=4) +   # display the value next to the "balloons"
+  scale_size(range = c(1, 8)) +
+  scale_x_discrete(breaks=1:length(vars_x_axis), labels=vars_x_axis, position='top') +   
+  scale_y_discrete(breaks=1:length(vars_y_axis), labels=vars_y_axis) +                 
+  theme_bw() +
+  theme(axis.line = element_blank(),            
+        axis.title = element_blank(),          
+        panel.border = element_blank(),         
+        panel.grid.major.x = element_blank(),   
+        panel.grid.minor.x = element_blank(),
+        legend.position = "none",
+        axis.text = element_text(size = 10, color = "black"),
+        axis.ticks = element_blank())   
+
+pdf("2_OutputFigs/Balloonplot_4thgen_log.pdf", height = 2, width = 7)
+baloonplot_4thgen
+invisible(dev.off())
+
+baloonplot_4thgen
+```
+```{r}
+mahala_all_3rdgen <- mahala_all_minmax %>%
+  filter(var1 == "3rd Gen" | var2 == "3rd Gen") %>%
+  mutate(var_pair = gsub("3rd Gen", "", var_pair)) %>%
+  mutate(var_pair = gsub("_", "", var_pair)) %>%
+  dplyr::select(c(var_pair, `All Mediators`:`Prot/Enz`)) %>%
+  pivot_longer(!var_pair, names_to = "variable", values_to = "value") %>%
+  mutate(value = round(value, digits = 3))
+
+row_df <- data.frame(var_pair = c("Control", "4th Gen", "Pre-COPD", "GOLD 1/2", "GOLD 3"), row = c(5, 4, 3, 2, 1))
+col_df <- data.frame(variable = c("All Mediators", "Inflamm", "Chemotax", "Prot/Enz"), col = c(1, 2, 3, 4))
+
+mahala_all_3rdgen <- mahala_all_3rdgen %>%
+  left_join(row_df, by = "var_pair") %>%
+  left_join(col_df, by = "variable")
+
+mahala_all_3rdgen %>% arrange(row)
+
+vars_x_axis <- c("All Mediators", "Inflammatory", "Chemotactic", "Proteases/Enzymes")
+vars_y_axis <- c("GOLD 3", "GOLD 1/2", "Pre-COPD", "4th Gen EC", "Control")
+
+baloonplot_3rdgen <- ggplot(mahala_all_3rdgen, aes(x=factor(col), y=factor(row), color=var_pair, size=value)) +
+  scale_color_manual(values = rev(c("#BB3754FF","#f7d13d" , "#F98C0AFF", "#56106EFF", "#3b528b"))) +
+  geom_point() +    # plot as points
+  geom_text(aes(label=value, x=col + 0.25), size=4) +   # display the value next to the "balloons"
+  scale_size(range = c(1, 5.5)) +
+  scale_x_discrete(breaks=1:length(vars_x_axis), labels=vars_x_axis, position='top') +   
+  scale_y_discrete(breaks=1:length(vars_y_axis), labels=vars_y_axis) +                 
+  theme_bw() +
+  theme(axis.line = element_blank(),            
+        axis.title = element_blank(),          
+        panel.border = element_blank(),         
+        panel.grid.major.x = element_blank(),   
+        panel.grid.minor.x = element_blank(),
+        legend.position = "none",
+        axis.text = element_text(size = 10, color = "black"),
+        axis.ticks = element_blank())   
+
+pdf("2_OutputFigs/Balloonplot_3rdgen_log.pdf", height = 2, width = 7)
+baloonplot_3rdgen
+invisible(dev.off())
+
+baloonplot_3rdgen
+```
+
+
+# Write out table of results
+
+```{r}
+mahala_all_for_man <- mahala_all %>%
+  arrange(desc(var2)) %>%
+  arrange(desc(var1)) %>%
+  dplyr::select(-c(type:index))
+
+mahala_all_for_man_sim <- mahala_all_minmax %>%
+  arrange(desc(var2)) %>%
+  arrange(desc(var1)) %>%
+  dplyr::select(-c(var1:var2, type:index)) %>%
+  rename_with(.fn = ~paste0("sim_", .x), .cols = c('All Mediators':'Prot/Enz'))
+
+mahala_table <- left_join(mahala_all_for_man, mahala_all_for_man_sim, by = "var_pair") %>%
+  dplyr::select(-var_pair) %>%
+  rename("Group 1" = "var1", "Group 2" = "var2")
+
+write.xlsx(mahala_table, file = "3_OutputTables/MahalanobisDistAndSim.xlsx")
+```
+
+# Run permutation testing for Mahalanobis distance
+
+## All mediators
+
+1. Take all your samples and randomly shuffle the group labels
+2. Recalculate the Mahalanobis distance for this random labeling
+3. Repeat this a large number of times (e.g., 10,000 permutations) to build a null distribution of distances that you know represent purely random overlap. Although I guess if you have limited samples then it may still be hard get a meaningful “random” distribution. You could also maybe simulate new samples based on the variables in your real samples. 
+4. Compare your actual observed value to this null distribution to see how extreme it is.
+
+```{r}
+# Set seed
+set.seed(8016)
+
+# Write mahalanobis distance function
+mahala_calc <- function(inputdf) {
+  
+  # Prepare data to compare groups
+  group = matrix(inputdf$Group)
+  group = t(group[,1])
+  
+  variables = names(inputdf %>% select(-Group))
+  df = as.matrix(inputdf[,variables])
+  
+  # Calculate mahalanobis distance
+  mahala_sq <- pairwise.mahalanobis(x = df, group = group)
+  names = rownames(mahala_sq$means)
+  
+  # Extract mahalanobis distnace
+  mahala = sqrt(mahala_sq$distance)
+
+  # Set row and column names in the dissimilarity matrix
+  rownames(mahala) = names
+  colnames(mahala) = names
+
+  # Results
+  res <- data.frame(var1 = rownames(mahala)[row(mahala)[upper.tri(mahala)]], 
+           var2 = colnames(mahala)[col(mahala)[upper.tri(mahala)]], 
+           mahala_dist = mahala[upper.tri(mahala)]) %>%
+  unite(var_pair, var1, var2, sep = "_")
+  
+  # Return results
+  return(res)
+}
+
+# Scramble group labels
+md_combat_for_mahalo_scr <- md_combat_for_mahalo %>% 
+  mutate(Group = sample(Group))
+
+# Double check that the number in each group is the same for the original and scrambled dataset
+md_combat_for_mahalo %>% group_by(Group) %>% count(Group)
+md_combat_for_mahalo_scr %>% group_by(Group) %>% count(Group)
+
+# Run function to test and make sure results are the same 
+test_df <- mahala_calc(md_combat_for_mahalo_scr)
+
+# Number of permutations
+n_perm <- 10000
+
+# Store results
+all_mediators_permres <- data.frame()
+
+for (i in seq_len(n_perm)) { 
+  
+  # Scramble data
+  perm_df <- md_combat_for_mahalo %>%
+    mutate(Group = sample(Group))
+  
+  # Run function 
+  res <- mahala_calc(perm_df)
+  
+  # Add iteration
+  res <- res %>%
+    mutate(iteration = i)
+  
+  # Bind results
+  all_mediators_permres <- rbind(all_mediators_permres, res)
+  
+}
+
+# Plot results
+permutation_distribution <- ggplot(all_mediators_permres, aes(x = mahala_dist)) +
+  geom_histogram() +
+  facet_wrap(~ var_pair, scales = "free", nrow = 3)
+
+permutation_distribution
+```
+
+Quantify percentage of values smaller or larger than the distance we got with our data:
+```{r}
+percentiles <- all_mediators_permres %>%
+  group_by(var_pair) %>% 
+  summarise(ecdf_fun = list(stats::ecdf(mahala_dist)),
+            .groups = "drop") %>%
+  left_join(mahala_all_forgraph %>% rename("mahala_dist_actual" = "mahala_dist"), by = "var_pair") %>% 
+  mutate(percentile_ecdf = map2_dbl(ecdf_fun, mahala_dist_actual, ~ .x(.y) * 100)) %>%
+  select(var_pair, mahala_dist_actual, percentile_ecdf) %>%
+  mutate(dataset = "All Mediators")
+```
+
+Overlay actual distances on this graph: 
+```{r}
+# Prep annotation data 
+mahala_all_forgraph <- mahala_all %>% 
+  select(c(var_pair, `All Mediators`)) %>%
+  rename("mahala_dist" = "All Mediators")
+
+# Prepare dataframe specifying strip colors
+strip_fills_all_mediators_df <- percentiles %>%
+  mutate(Significance = ifelse(percentile_ecdf < 5, "Significantly Closer",
+                                    ifelse(percentile_ecdf < 15, "Trending Closer",
+                                           ifelse(percentile_ecdf < 85, "Not Significant",
+                                                  ifelse(percentile_ecdf < 95, "Trending Farther",
+                                                         ifelse(percentile_ecdf < 100, "Significantly Farther")))))) %>%
+  mutate(Highlight = recode(Significance, 
+                            "Significantly Closer" = "#6ee96e", 
+                            "Trending Closer" = "#d4f8d4", 
+                            "Not Significant" = "#EEEEEE",
+                            "Trending Farther" = "#d8f5ff", 
+                            "Significantly Farther" = "#62d8ff"))
+
+strip_fills_all_mediators <- setNames(strip_fills_all_mediators_df$Highlight, strip_fills_all_mediators_df$var_pair)
+
+# Plot
+permutation_distribution_withline <- ggplot(all_mediators_permres, aes(x = mahala_dist)) +
+  geom_histogram() +
+  geom_vline(data = mahala_all_forgraph, aes(xintercept = mahala_dist), color = "red", linetype = "dashed") +
+  labs(title = "All Mediators", y = "Count", x = "Raw Mahalanobis Distance") +
+  facet_wrap_color(~ var_pair, scales = "free", nrow = 3, colors = strip_fills_all_mediators) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+permutation_distribution_withline
+
+# Save plot
+png("2_OutputFigs/PermTesting_All.png", width = 9, height = 6, units = "in", res = 1200)
+permutation_distribution_withline
+invisible(dev.off())
+```
+
+## Immune/Inflammatory
+
+```{r}
+# Prepare dataframe
+md_combat_for_mahalo_imm <- md_combat_for_mahalo %>% select(c(all_of(immuno_inflamm), Group))
+
+# Number of permutations
+n_perm <- 10000
+
+# Store results
+mediators_immuno_permres <- data.frame()
+
+for (i in seq_len(n_perm)) { 
+  
+  # Scramble data
+  perm_df <- md_combat_for_mahalo_imm %>%
+    mutate(Group = sample(Group))
+  
+  # Run function 
+  res <- mahala_calc(perm_df)
+  
+  # Add iteration
+  res <- res %>%
+    mutate(iteration = i)
+  
+  # Bind results
+  mediators_immuno_permres <- rbind(mediators_immuno_permres, res)
+  
+}
+```
+
+```{r}
+percentiles_immuno <- mediators_immuno_permres %>%
+  group_by(var_pair) %>% 
+  summarise(ecdf_fun = list(stats::ecdf(mahala_dist)),
+            .groups = "drop") %>%
+  left_join(mahala_all_forgraph_imm %>% rename("mahala_dist_actual" = "mahala_dist"), by = "var_pair") %>% 
+  mutate(percentile_ecdf = map2_dbl(ecdf_fun, mahala_dist_actual, ~ .x(.y) * 100)) %>%
+  select(var_pair, mahala_dist_actual, percentile_ecdf) %>%
+  mutate(dataset = "Immune/Inflammatory")
+```
+
+```{r}
+# Prep annotation data 
+mahala_all_forgraph_imm <- mahala_all %>% 
+  select(c(var_pair, `Inflamm`)) %>%
+  rename("mahala_dist" = "Inflamm")
+
+# Prepare strip annotation
+strip_fills_immuno_df <- percentiles_immuno %>%
+  mutate(Significance = ifelse(percentile_ecdf < 5, "Significantly Closer",
+                                    ifelse(percentile_ecdf < 15, "Trending Closer",
+                                           ifelse(percentile_ecdf < 85, "Not Significant",
+                                                  ifelse(percentile_ecdf < 95, "Trending Farther",
+                                                         ifelse(percentile_ecdf < 100, "Significantly Farther")))))) %>%
+  mutate(Highlight = recode(Significance, 
+                            "Significantly Closer" = "#6ee96e", 
+                            "Trending Closer" = "#d4f8d4", 
+                            "Not Significant" = "#EEEEEE",
+                            "Trending Farther" = "#d8f5ff", 
+                            "Significantly Farther" = "#62d8ff"))
+
+strip_fills_immuno <- setNames(strip_fills_immuno_df$Highlight, strip_fills_immuno_df$var_pair)
+
+
+# Make graph
+permutation_distribution_withline_imm <- ggplot(mediators_immuno_permres, aes(x = mahala_dist)) +
+  geom_histogram() +
+  geom_vline(data = mahala_all_forgraph_imm, aes(xintercept = mahala_dist), color = "red", linetype = "dashed") +   
+  labs(title = "Immune/Inflammatory Mediators", y = "Count", x = "Raw Mahalanobis Distance") +
+  facet_wrap_color(~ var_pair, scales = "free", nrow = 3, colors = strip_fills_immuno) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+permutation_distribution_withline_imm
+
+png("2_OutputFigs/PermTesting_Immune.png", width = 9, height = 6, units = "in", res = 1200)
+permutation_distribution_withline_imm
+invisible(dev.off())
+```
+
+
+## Chemotaxis
+
+```{r}
+# Prepare dataframe
+md_combat_for_mahalo_chemo <- md_combat_for_mahalo %>% select(c(all_of(chemotax), Group))
+
+# Number of permutations
+n_perm <- 10000
+
+# Store results
+mediators_chemo_permres <- data.frame()
+
+for (i in seq_len(n_perm)) { 
+  
+  # Scramble data
+  perm_df <- md_combat_for_mahalo_chemo %>%
+    mutate(Group = sample(Group))
+  
+  # Run function 
+  res <- mahala_calc(perm_df)
+  
+  # Add iteration
+  res <- res %>%
+    mutate(iteration = i)
+  
+  # Bind results
+  mediators_chemo_permres <- rbind(mediators_chemo_permres, res)
+  
+}
+```
+
+```{r}
+percentiles_chemo <- mediators_chemo_permres %>%
+  group_by(var_pair) %>% 
+  summarise(ecdf_fun = list(stats::ecdf(mahala_dist)),
+            .groups = "drop") %>%
+  left_join(mahala_all_forgraph_chemo%>% rename("mahala_dist_actual" = "mahala_dist"), by = "var_pair") %>% 
+  mutate(percentile_ecdf = map2_dbl(ecdf_fun, mahala_dist_actual, ~ .x(.y) * 100)) %>%
+  select(var_pair, mahala_dist_actual, percentile_ecdf) %>%
+  mutate(dataset = "Chemotactic")
+```
+
+```{r}
+# Prep annotation data 
+mahala_all_forgraph_chemo <- mahala_all %>% 
+  select(c(var_pair, `Chemotax`)) %>%
+  rename("mahala_dist" = "Chemotax")
+
+# Prepare strip annotation
+strip_fills_chemo_df <- percentiles_chemo %>%
+  mutate(Significance = ifelse(percentile_ecdf < 5, "Significantly Closer",
+                                    ifelse(percentile_ecdf < 15, "Trending Closer",
+                                           ifelse(percentile_ecdf < 85, "Not Significant",
+                                                  ifelse(percentile_ecdf < 95, "Trending Farther",
+                                                         ifelse(percentile_ecdf < 100, "Significantly Farther")))))) %>%
+  mutate(Highlight = recode(Significance, 
+                            "Significantly Closer" = "#6ee96e", 
+                            "Trending Closer" = "#d4f8d4", 
+                            "Not Significant" = "#EEEEEE",
+                            "Trending Farther" = "#d8f5ff", 
+                            "Significantly Farther" = "#62d8ff"))
+
+strip_fills_chemo <- setNames(strip_fills_chemo_df$Highlight, strip_fills_chemo_df$var_pair)
+
+# Make graph
+permutation_distribution_withline_chemo <- ggplot(mediators_chemo_permres, aes(x = mahala_dist)) +
+  geom_histogram() +
+  geom_vline(data = mahala_all_forgraph_chemo, aes(xintercept = mahala_dist), color = "red", linetype = "dashed") +
+  labs(title = "Chemotactic Mediators", y = "Count", x = "Raw Mahalanobis Distance") +
+  facet_wrap_color(~ var_pair, scales = "free", nrow = 3, colors = strip_fills_chemo) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+permutation_distribution_withline_chemo
+
+png("2_OutputFigs/PermTesting_Chemotax.png", width = 9, height = 6, units = "in", res = 1200)
+permutation_distribution_withline_chemo
+invisible(dev.off())
+```
+
+
+## Proteases/Enzymes
+
+```{r}
+# Prepare dataframe
+md_combat_for_mahalo_prot <- md_combat_for_mahalo %>% select(c(all_of(prot_enzyme), Group))
+
+# Number of permutations
+n_perm <- 10000
+
+# Store results
+mediators_prot_permres <- data.frame()
+
+for (i in seq_len(n_perm)) { 
+  
+  # Scramble data
+  perm_df <- md_combat_for_mahalo_prot %>%
+    mutate(Group = sample(Group))
+  
+  # Run function 
+  res <- mahala_calc(perm_df)
+  
+  # Add iteration
+  res <- res %>%
+    mutate(iteration = i)
+  
+  # Bind results
+  mediators_prot_permres <- rbind(mediators_prot_permres, res)
+  
+}
+```
+
+```{r}
+percentiles_prot <- mediators_prot_permres %>%
+  group_by(var_pair) %>% 
+  summarise(ecdf_fun = list(stats::ecdf(mahala_dist)),
+            .groups = "drop") %>%
+  left_join(mahala_all_forgraph_prot %>% rename("mahala_dist_actual" = "mahala_dist"), by = "var_pair") %>% 
+  mutate(percentile_ecdf = map2_dbl(ecdf_fun, mahala_dist_actual, ~ .x(.y) * 100)) %>%
+  select(var_pair, mahala_dist_actual, percentile_ecdf) %>%
+  mutate(dataset = "Proteases/Enzymes")
+```
+
+```{r}
+# Prep annotation data 
+mahala_all_forgraph_prot <- mahala_all %>% 
+  select(c(var_pair, `Prot/Enz`)) %>%
+  rename("mahala_dist" = "Prot/Enz")
+
+# Prepare strip annotation
+strip_fills_prot_df <- percentiles_prot %>%
+  mutate(Significance = ifelse(percentile_ecdf < 5, "Significantly Closer",
+                                    ifelse(percentile_ecdf < 15, "Trending Closer",
+                                           ifelse(percentile_ecdf < 85, "Not Significant",
+                                                  ifelse(percentile_ecdf < 95, "Trending Farther",
+                                                         ifelse(percentile_ecdf < 100, "Significantly Farther")))))) %>%
+  mutate(Highlight = recode(Significance, 
+                            "Significantly Closer" = "#6ee96e", 
+                            "Trending Closer" = "#d4f8d4", 
+                            "Not Significant" = "#EEEEEE",
+                            "Trending Farther" = "#d8f5ff", 
+                            "Significantly Farther" = "#62d8ff"))
+
+strip_fills_prot <- setNames(strip_fills_prot_df$Highlight, strip_fills_prot_df$var_pair)
+
+permutation_distribution_withline_prot <- ggplot(mediators_prot_permres, aes(x = mahala_dist)) +
+  geom_histogram() +
+  geom_vline(data = mahala_all_forgraph_prot, aes(xintercept = mahala_dist), color = "red", linetype = "dashed") +
+  labs(title = "Proteases/Enzymes", y = "Count", x = "Raw Mahalanobis Distance") +
+  facet_wrap_color(~ var_pair, scales = "free", nrow = 3, colors = strip_fills_prot) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+permutation_distribution_withline_prot
+
+png("2_OutputFigs/PermTesting_Prot.png", width = 9, height = 6, units = "in", res = 1200)
+permutation_distribution_withline_prot
+invisible(dev.off())
+```
+
+
+## Save results for supplemental table
+
+```{r}
+percentiles_res_full <- rbind(percentiles, percentiles_chemo, percentiles_immuno, percentiles_prot)
+
+write.xlsx(percentiles_res_full, "3_OutputTables/PermutationTestingPercentiles.xlsx")
+```
+
